@@ -1,0 +1,314 @@
+# Supabase migrations + email templates
+# - push dev → staging DB | push main → production DB
+#
+# Repository secrets (Settings → Secrets and variables → Actions → Repository secrets):
+#   STAGING_SUPABASE_DB_URL    — Session pooler URI (required for staging pushes)
+#   PRODUCTION_SUPABASE_DB_URL — same for production
+#   ENV_SUPABASE_ACCESS_TOKEN  — personal access token from supabase.com/dashboard/account/tokens
+#
+# Staging example (password must be URL-encoded in the URI):
+#   postgresql://postgres.kzfdnjbntgzsyvqprxvk:Blabberai123%21%40%23@aws-1-us-east-2.pooler.supabase.com:5432/postgres
+#
+# Do NOT use db.<ref>.supabase.co (IPv6-only; fails on GitHub runners).
+
+name: Supabase
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "supabase/**"
+      - ".github/workflows/supabase.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      auth_config_only:
+        description: Push auth email templates/config only, and skip database migrations
+        required: false
+        type: boolean
+        default: false
+      repair_existing_schema_history:
+        description: Mark repo migrations as applied before pushing; use only when the existing remote schema was created outside Supabase migration history
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  push-staging:
+    name: Push migrations (staging)
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Push email templates + auth config to staging
+        env:
+          PROJECT_REF: ${{ secrets.STAGING_SUPABASE_PROJECT_REF }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.ENV_SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT_REF:-}" ]; then
+            echo "::error::STAGING_SUPABASE_PROJECT_REF is empty or not defined."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+            echo "::error::ENV_SUPABASE_ACCESS_TOKEN is empty or not defined."
+            exit 1
+          fi
+          echo "Pushing auth config to project: ${PROJECT_REF}"
+          PAYLOAD="$(jq -n \
+            --arg confirmation_subject "Confirm your Blabber account" \
+            --arg confirmation "$(cat supabase/templates/confirmation.html)" \
+            --arg recovery_subject "Reset your Blabber password" \
+            --arg recovery "$(cat supabase/templates/reset-password.html)" \
+            --arg magic_link_subject "Sign in to Blabber" \
+            --arg magic_link "$(cat supabase/templates/magic-link.html)" \
+            --arg email_change_subject "Confirm your Blabber email change" \
+            --arg email_change "$(cat supabase/templates/change-email.html)" \
+            '{
+              mailer_subjects_confirmation: $confirmation_subject,
+              mailer_templates_confirmation_content: $confirmation,
+              mailer_subjects_recovery: $recovery_subject,
+              mailer_templates_recovery_content: $recovery,
+              mailer_subjects_magic_link: $magic_link_subject,
+              mailer_templates_magic_link_content: $magic_link,
+              mailer_subjects_email_change: $email_change_subject,
+              mailer_templates_email_change_content: $email_change,
+              rate_limit_sign_in_sign_ups: 10000,
+              rate_limit_token_refresh: 10000,
+              rate_limit_verify: 10000
+            }')"
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X PATCH \
+            "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth" \
+            -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+          BODY=$(printf '%s' "$RESPONSE" | head -n -1)
+          echo "HTTP ${HTTP_CODE}: ${BODY}"
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Auth config push failed (HTTP ${HTTP_CODE}): ${BODY}"
+            exit 1
+          fi
+          echo "Auth config pushed."
+      - name: Repair staging migration history for existing schema
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.repair_existing_schema_history == 'true' && github.event.inputs.auth_config_only != 'true'
+        env:
+          DB_URL: ${{ secrets.STAGING_SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          trim() { printf '%s' "$1" | tr -d '\n\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"; }
+          DB_URL="$(trim "${DB_URL:-}")"
+          if [ -z "$DB_URL" ]; then
+            echo "::error::STAGING_SUPABASE_DB_URL is empty or not defined."
+            exit 1
+          fi
+          mapfile -t VERSIONS < <(find supabase/migrations -maxdepth 1 -name '*.sql' -printf '%f\n' | sed -E 's/^([0-9]+)_.*/\1/' | sort -u)
+          if [ "${#VERSIONS[@]}" -eq 0 ]; then
+            echo "::error::No local migrations found."
+            exit 1
+          fi
+          echo "Marking ${#VERSIONS[@]} local migrations as applied in staging migration history."
+          supabase migration repair --db-url "$DB_URL" --status applied "${VERSIONS[@]}"
+          supabase migration list --db-url "$DB_URL"
+      - name: Push migrations to staging
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.auth_config_only != 'true'
+        env:
+          DB_URL: ${{ secrets.STAGING_SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          trim() { printf '%s' "$1" | tr -d '\n\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"; }
+          DB_URL="$(trim "${DB_URL:-}")"
+
+          if [ -z "$DB_URL" ]; then
+            echo "::error::STAGING_SUPABASE_DB_URL is empty or not defined."
+            echo "Add a Repository secret named exactly STAGING_SUPABASE_DB_URL"
+            echo "(Settings → Secrets and variables → Actions → Repository secrets — NOT only Environments)."
+            exit 1
+          fi
+
+          case "$DB_URL" in
+            postgres://*|postgresql://*) ;;
+            *)
+              echo "::error::STAGING_SUPABASE_DB_URL must start with postgres:// or postgresql://"
+              exit 1
+              ;;
+          esac
+
+          HOST="$(python3 -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "")' "$DB_URL")"
+          if [ -z "$HOST" ]; then
+            echo "::error::Could not parse hostname from STAGING_SUPABASE_DB_URL. Use the full Session pooler URI from Supabase Dashboard → Connect → Transaction pooler or Session pooler, for example: postgresql://postgres.<project-ref>:<password>@aws-...pooler.supabase.com:5432/postgres"
+            exit 1
+          fi
+          case "$HOST" in
+            db.*.supabase.co)
+              echo "::error::Use the pooler host (*.pooler.supabase.com), not db.<ref>.supabase.co"
+              exit 1
+              ;;
+          esac
+
+          echo "Database host: ${HOST}"
+          set +e
+          PUSH_OUTPUT="$(supabase db push --db-url "$DB_URL" --include-all --yes 2>&1)"
+          PUSH_STATUS=$?
+          set -e
+          printf '%s\n' "$PUSH_OUTPUT"
+          if [ "$PUSH_STATUS" -ne 0 ]; then
+            if printf '%s\n' "$PUSH_OUTPUT" | grep -q 'type "creator_onboarding_status" already exists'; then
+              echo "Baseline schema already exists but 20240319000000 is missing from migration history."
+              echo "Marking baseline migration as applied, then retrying db push once."
+              supabase migration repair --db-url "$DB_URL" --status applied 20240319000000
+              supabase db push --db-url "$DB_URL" --include-all --yes
+            else
+              exit "$PUSH_STATUS"
+            fi
+          fi
+          supabase migration list --db-url "$DB_URL"
+
+  push-production:
+    name: Push migrations (production)
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Push email templates + auth config to production
+        env:
+          PROJECT_REF: ${{ secrets.PRODUCTION_SUPABASE_PROJECT_REF }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.ENV_SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT_REF:-}" ]; then
+            echo "::error::PRODUCTION_SUPABASE_PROJECT_REF is empty or not defined."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+            echo "::error::ENV_SUPABASE_ACCESS_TOKEN is empty or not defined."
+            exit 1
+          fi
+          echo "Pushing auth config to project: ${PROJECT_REF}"
+          PAYLOAD="$(jq -n \
+            --arg confirmation_subject "Confirm your Blabber account" \
+            --arg confirmation "$(cat supabase/templates/confirmation.html)" \
+            --arg recovery_subject "Reset your Blabber password" \
+            --arg recovery "$(cat supabase/templates/reset-password.html)" \
+            --arg magic_link_subject "Sign in to Blabber" \
+            --arg magic_link "$(cat supabase/templates/magic-link.html)" \
+            --arg email_change_subject "Confirm your Blabber email change" \
+            --arg email_change "$(cat supabase/templates/change-email.html)" \
+            '{
+              mailer_subjects_confirmation: $confirmation_subject,
+              mailer_templates_confirmation_content: $confirmation,
+              mailer_subjects_recovery: $recovery_subject,
+              mailer_templates_recovery_content: $recovery,
+              mailer_subjects_magic_link: $magic_link_subject,
+              mailer_templates_magic_link_content: $magic_link,
+              mailer_subjects_email_change: $email_change_subject,
+              mailer_templates_email_change_content: $email_change,
+              rate_limit_sign_in_sign_ups: 10000,
+              rate_limit_token_refresh: 10000,
+              rate_limit_verify: 10000
+            }')"
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X PATCH \
+            "https://api.supabase.com/v1/projects/${PROJECT_REF}/config/auth" \
+            -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+          BODY=$(printf '%s' "$RESPONSE" | head -n -1)
+          echo "HTTP ${HTTP_CODE}: ${BODY}"
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Auth config push failed (HTTP ${HTTP_CODE}): ${BODY}"
+            exit 1
+          fi
+          echo "Auth config pushed."
+      - name: Repair production migration history for existing schema
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.repair_existing_schema_history == 'true' && github.event.inputs.auth_config_only != 'true'
+        env:
+          DB_URL: ${{ secrets.PRODUCTION_SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          trim() { printf '%s' "$1" | tr -d '\n\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"; }
+          DB_URL="$(trim "${DB_URL:-}")"
+          if [ -z "$DB_URL" ]; then
+            echo "::error::PRODUCTION_SUPABASE_DB_URL is empty or not defined."
+            exit 1
+          fi
+          mapfile -t VERSIONS < <(find supabase/migrations -maxdepth 1 -name '*.sql' -printf '%f\n' | sed -E 's/^([0-9]+)_.*/\1/' | sort -u)
+          if [ "${#VERSIONS[@]}" -eq 0 ]; then
+            echo "::error::No local migrations found."
+            exit 1
+          fi
+          echo "Marking ${#VERSIONS[@]} local migrations as applied in production migration history."
+          supabase migration repair --db-url "$DB_URL" --status applied "${VERSIONS[@]}"
+          supabase migration list --db-url "$DB_URL"
+      - name: Push migrations to production
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.auth_config_only != 'true'
+        env:
+          DB_URL: ${{ secrets.PRODUCTION_SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          trim() { printf '%s' "$1" | tr -d '\n\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"; }
+          DB_URL="$(trim "${DB_URL:-}")"
+
+          if [ -z "$DB_URL" ]; then
+            echo "::error::PRODUCTION_SUPABASE_DB_URL is empty or not defined."
+            echo "Add a Repository secret named exactly PRODUCTION_SUPABASE_DB_URL"
+            exit 1
+          fi
+
+          case "$DB_URL" in
+            postgres://*|postgresql://*) ;;
+            *)
+              echo "::error::PRODUCTION_SUPABASE_DB_URL must start with postgres:// or postgresql://"
+              exit 1
+              ;;
+          esac
+
+          HOST="$(python3 -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "")' "$DB_URL")"
+          if [ -z "$HOST" ]; then
+            echo "::error::Could not parse hostname from PRODUCTION_SUPABASE_DB_URL. Use the full Session pooler URI from Supabase Dashboard → Connect → Transaction pooler or Session pooler, for example: postgresql://postgres.<project-ref>:<password>@aws-...pooler.supabase.com:5432/postgres"
+            exit 1
+          fi
+          case "$HOST" in
+            db.*.supabase.co)
+              echo "::error::Use the pooler host (*.pooler.supabase.com), not db.<ref>.supabase.co"
+              exit 1
+              ;;
+          esac
+
+          echo "Database host: ${HOST}"
+          set +e
+          PUSH_OUTPUT="$(supabase db push --db-url "$DB_URL" --include-all --yes 2>&1)"
+          PUSH_STATUS=$?
+          set -e
+          printf '%s\n' "$PUSH_OUTPUT"
+          if [ "$PUSH_STATUS" -ne 0 ]; then
+            if printf '%s\n' "$PUSH_OUTPUT" | grep -q 'type "creator_onboarding_status" already exists'; then
+              echo "Baseline schema already exists but 20240319000000 is missing from migration history."
+              echo "Marking baseline migration as applied, then retrying db push once."
+              supabase migration repair --db-url "$DB_URL" --status applied 20240319000000
+              supabase db push --db-url "$DB_URL" --include-all --yes
+            else
+              exit "$PUSH_STATUS"
+            fi
+          fi
+          supabase migration list --db-url "$DB_URL"

@@ -1,0 +1,54 @@
+node_modules
+.next
+
+# Generated Supabase email HTML (run: npm run email:export-templates)
+src/emails/generated
+
+# Local secrets & environment files (never commit)
+.env
+.env.local
+.env.production
+.env.prod
+.env.staging
+.env.*.local
+.env copy.local
+.env.backup
+.env.local.backup
+
+# Supabase CLI link metadata (regenerated on `supabase link`)
+supabase/.temp/
+
+# DB dumps & local backups (regenerate baseline: keep full.sql locally under backups/)
+backups/
+
+# Vendor docs / credentials (do not commit secrets)
+epoch docs/
+
+# Dev scratch / reference assets (not part of the app)
+img gen ref/
+
+# One-off staging SQL (superseded by supabase/migrations/)
+supabase/staging/
+
+# Local TLS certs, DB dumps, build artifacts
+*.pem
+*.dump
+test.dump
+tsconfig.tsbuildinfo
+.DS_Store
+
+# WooCommerce reference plugin (not part of the Next.js app)
+onyx-live/
+
+# Legacy Cursor rules file (use .cursor/rules/ instead)
+cursorrules.json
+
+.branches/
+
+.claude/
+
+CLAUDE.md
+
+Dim/
+# Sentry Config File
+.env.sentry-build-plugin

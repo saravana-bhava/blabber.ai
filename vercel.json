@@ -1,0 +1,7 @@
+{
+  "crons": [
+    { "path": "/api/cron/onyx-rebill", "schedule": "0 12 * * *" },
+    { "path": "/api/cron/credit-subscription-rebill", "schedule": "5 12 * * *" },
+    { "path": "/api/cron/ai-dm-follow-ups", "schedule": "0 * * * *" }
+  ]
+}

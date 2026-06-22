@@ -1,0 +1,12 @@
+# Optional local services (Supabase runs via `supabase start`, not this file).
+# Start with: docker compose --profile dev up -d
+# Or: npm run infra:docker
+
+services:
+  mailpit:
+    image: axllent/mailpit:latest
+    profiles: ["dev"]
+    ports:
+      - "1025:1025"   # SMTP (point Resend dev proxy or app SMTP here if needed)
+      - "8025:8025"   # Web UI — http://localhost:8025
+    restart: unless-stopped
